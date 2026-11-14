@@ -1,0 +1,2148 @@
+// Damez Loan: Prisma schema (MySQL 8).
+// Conventions: money = BigInt kobo, suffix `Kobo`; timestamps UTC; PII columns end in `Enc` (field-encrypted)
+// with a blind index `…Hash` (HMAC) where lookup is needed.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x", "linux-musl-arm64-openssl-3.0.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum AuditOutcome {
+  SUCCESS
+  FAILURE
+  DENIED
+}
+
+enum ApprovalStatus {
+  PENDING
+  ESCALATED
+  EXECUTED
+  REJECTED
+  CANCELLED
+  FAILED
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+  ESCALATED
+}
+
+enum NotificationChannel {
+  SMS
+  EMAIL
+  WHATSAPP
+  IN_APP
+}
+
+enum DeliveryStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  FAILED
+}
+
+enum ConsentStatus {
+  GRANTED
+  REVOKED
+  EXPIRED
+}
+
+enum KycStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum DsrType {
+  ACCESS
+  RECTIFICATION
+  ERASURE
+  PORTABILITY
+  OBJECTION
+}
+
+enum DsrStatus {
+  OPEN
+  IN_PROGRESS
+  COMPLETED
+  REJECTED
+}
+
+enum LoginOutcome {
+  SUCCESS
+  PASSWORD_OK_TOTP_PENDING
+  BAD_PASSWORD
+  BAD_TOTP
+  LOCKED
+  UNKNOWN_USER
+  DISABLED
+}
+
+/**
+ * ───────────── organisation / RBAC ─────────────
+ */
+
+model Branch {
+  id           String   @id @default(cuid())
+  code         String   @unique
+  name         String
+  state        String
+  city         String
+  address      String?
+  isHeadOffice Boolean  @default(false)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  users     StaffUser[]
+  customers Customer[]
+}
+
+model Role {
+  id           String   @id @default(cuid())
+  key          String   @unique
+  name         String
+  description  String   @default("")
+  isSystem     Boolean  @default(false)
+  branchScoped Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  users          StaffUser[]
+  permissions    RolePermission[]
+  approvalLimits RoleApprovalLimit[]
+}
+
+model Permission {
+  id          String @id @default(cuid())
+  key         String @unique
+  module      String
+  description String
+
+  roles RolePermission[]
+
+  @@index([module])
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+/// Per-role approval limit per action type. maxAmountKobo NULL = unlimited. Missing row = cannot approve amount-bearing requests.
+model RoleApprovalLimit {
+  id            String  @id @default(cuid())
+  roleId        String
+  actionType    String
+  maxAmountKobo BigInt?
+  role          Role    @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, actionType])
+}
+
+/**
+ * ───────────── staff users & sessions ─────────────
+ */
+
+model StaffUser {
+  id                 String     @id @default(cuid())
+  email              String     @unique
+  fullName           String
+  phone              String?
+  passwordHash       String
+  passwordChangedAt  DateTime   @default(now())
+  mustChangePassword Boolean    @default(false)
+  roleId             String
+  branchId           String?
+  allBranches        Boolean    @default(false)
+  status             UserStatus @default(ACTIVE)
+  totpSecretEnc      String?    @db.Text
+  totpEnabled        Boolean    @default(false)
+  failedLoginCount   Int        @default(0)
+  lockedUntil        DateTime?
+  lastLoginAt        DateTime?
+  lastLoginIp        String?
+  lastTotpStep       Int?
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+  createdById        String?
+
+  role          Role                @relation(fields: [roleId], references: [id])
+  branch        Branch?             @relation(fields: [branchId], references: [id])
+  sessions      Session[]
+  approvals     ApprovalRequest[]   @relation("Maker")
+  steps         ApprovalStep[]
+  notifications InAppNotification[]
+
+  @@index([roleId])
+  @@index([branchId])
+}
+
+model Session {
+  id            String    @id @default(cuid())
+  userId        String
+  tokenHash     String    @unique
+  ip            String?
+  userAgent     String?   @db.Text
+  deviceHash    String?
+  createdAt     DateTime  @default(now())
+  lastActiveAt  DateTime  @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  revokedReason String?
+  user          StaffUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model LoginEvent {
+  id         String       @id @default(cuid())
+  userId     String?
+  email      String
+  ip         String?
+  userAgent  String?      @db.Text
+  deviceHash String?
+  outcome    LoginOutcome
+  createdAt  DateTime     @default(now())
+
+  @@index([userId, createdAt])
+  @@index([createdAt])
+  @@index([ip, createdAt])
+}
+
+/**
+ * ───────────── audit (immutable; triggers block UPDATE/DELETE) ─────────────
+ */
+
+model AuditLog {
+  id           String       @id @default(cuid())
+  seq          BigInt       @unique
+  createdAt    DateTime     @default(now()) @db.DateTime(3)
+  actorId      String?
+  actorName    String?
+  actorEmail   String?
+  actorRole    String?
+  action       String
+  resourceType String
+  resourceId   String?
+  before       Json?
+  after        Json?
+  ip           String?
+  userAgent    String?      @db.Text
+  branchId     String?
+  outcome      AuditOutcome @default(SUCCESS)
+  metadata     Json?
+  prevHash     String       @db.Char(64)
+  hash         String       @db.Char(64)
+
+  @@index([createdAt])
+  @@index([actorId, createdAt])
+  @@index([resourceType, resourceId])
+  @@index([action])
+}
+
+/// Single mutable row used to serialise hash-chain appends.
+model AuditChainHead {
+  id       Int    @id
+  lastSeq  BigInt
+  lastHash String @db.Char(64)
+}
+
+/**
+ * ───────────── maker-checker ─────────────
+ */
+
+model ApprovalPolicy {
+  type          String   @id
+  thresholdKobo BigInt   @default(0)
+  enabled       Boolean  @default(true)
+  updatedAt     DateTime @updatedAt
+}
+
+model ApprovalRequest {
+  id              String         @id @default(cuid())
+  type            String
+  status          ApprovalStatus @default(PENDING)
+  summary         String
+  reason          String?
+  amountKobo      BigInt?
+  payload         Json
+  makerId         String
+  branchId        String?
+  escalationLevel Int            @default(0)
+  decidedAt       DateTime?
+  executionResult Json?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  maker StaffUser      @relation("Maker", fields: [makerId], references: [id])
+  steps ApprovalStep[]
+
+  @@index([status, type])
+  @@index([makerId])
+  @@index([branchId])
+}
+
+model ApprovalStep {
+  id                String           @id @default(cuid())
+  requestId         String
+  approverId        String
+  approverRole      String
+  /// approver's limit at decision time; unlimited=true means no cap, null+false means n/a (no amount)
+  approverLimitKobo BigInt?
+  approverUnlimited Boolean          @default(false)
+  decision          ApprovalDecision
+  comment           String?
+  createdAt         DateTime         @default(now())
+
+  request  ApprovalRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  approver StaffUser       @relation(fields: [approverId], references: [id])
+
+  @@index([requestId])
+}
+
+/**
+ * ───────────── notifications ─────────────
+ */
+
+model NotificationTemplate {
+  id        String              @id @default(cuid())
+  key       String
+  channel   NotificationChannel
+  name      String
+  subject   String?
+  body      String              @db.Text
+  variables Json
+  isActive  Boolean             @default(true)
+  updatedAt DateTime            @updatedAt
+
+  @@unique([key, channel])
+}
+
+model NotificationDelivery {
+  id                String              @id @default(cuid())
+  channel           NotificationChannel
+  provider          String
+  recipientMasked   String
+  recipientHash     String?
+  templateKey       String?
+  /// rendered body with PII scrubbed by the Redactor
+  bodyRedacted      String?             @db.Text
+  status            DeliveryStatus      @default(QUEUED)
+  error             String?             @db.Text
+  providerMessageId String?
+  attempts          Int                 @default(0)
+  createdAt         DateTime            @default(now())
+  sentAt            DateTime?
+
+  @@index([channel, status])
+  @@index([createdAt])
+}
+
+model InAppNotification {
+  id        String    @id @default(cuid())
+  userId    String
+  title     String
+  body      String    @db.Text
+  href      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+  user      StaffUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+}
+
+/**
+ * ───────────── settings / products ─────────────
+ */
+
+model SystemSetting {
+  key         String   @id
+  namespace   String
+  value       Json
+  description String?
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+
+  @@index([namespace])
+}
+
+model LoanProduct {
+  id                   String   @id @default(cuid())
+  code                 String   @unique
+  name                 String
+  minAmountKobo        BigInt
+  maxAmountKobo        BigInt
+  monthlyRateBps       Int
+  minTenorMonths       Int
+  maxTenorMonths       Int
+  isActive             Boolean  @default(true)
+  description          String   @default("") @db.VarChar(1000)
+  interestMethod       String   @default("FLAT")
+  processingFeeBps     Int      @default(0)
+  managementFeeBps     Int      @default(100)
+  insuranceFeeBps      Int      @default(50)
+  penaltyBpsPerDay     Int      @default(25)
+  penaltyGraceDays     Int      @default(3)
+  gracePeriodDays      Int      @default(0)
+  minKycTier           Int      @default(1)
+  requiredDocs         Json?
+  minAge               Int      @default(18)
+  maxAge               Int      @default(65)
+  eligibilityOverrides Json?
+  scorecardKey         String   @default("default")
+  allowGuarantor       Boolean  @default(true)
+  allowCollateral      Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  applications LoanApplication[]
+  loans        Loan[]
+}
+
+/**
+ * ───────────── customers (skeleton; NDPA-aware) ─────────────
+ */
+
+model Customer {
+  id                 String    @id @default(cuid())
+  branchId           String?
+  firstName          String
+  lastName           String
+  phoneEnc           String    @db.Text
+  phoneHash          String    @unique
+  emailEnc           String?   @db.Text
+  emailHash          String?
+  bvnEnc             String?   @db.Text
+  bvnHash            String?   @unique
+  ninEnc             String?   @db.Text
+  ninHash            String?
+  accountNumberEnc   String?   @db.Text
+  accountNumberHash  String?
+  bankCode           String?
+  state              String?
+  employer           String?
+  monthlyIncomeKobo  BigInt?
+  salaryDay          Int?
+  kycStatus          KycStatus @default(PENDING)
+  kycTier            Int       @default(0)
+  gender             String?
+  /// encrypted yyyy-mm-dd (AAD customer:<id>:dob) + birth year for coarse analytics
+  dobEnc             String?   @db.Text
+  birthYear          Int?
+  /// encrypted JSON {line1, city, state, landmark}
+  addressEnc         String?   @db.Text
+  city               String?
+  employmentStatus   String?
+  accountNameEnc     String?   @db.Text
+  /// sha256 of the BVN-registered photo; used to detect one face under several identities (the photo itself is never stored)
+  bvnPhotoHash       String?
+  maritalStatus      String?
+  /// encrypted JSON {firstName, lastName, phone, relationship, address} – Next of Kin
+  nokEnc             String?   @db.Text
+  /// how the customer heard about Damez (SOCIAL_MEDIA | CUSTOMER_REFERRAL | RADIO_TV_NEWSPAPER | WALK_IN | OTHER)
+  aboutUsChannel     String?
+  portalRegisteredAt DateTime?
+  phoneVerifiedAt    DateTime?
+  emailVerifiedAt    DateTime?
+  bvnVerifiedAt      DateTime?
+  ninVerifiedAt      DateTime?
+  faceVerifiedAt     DateTime?
+  addressVerifiedAt  DateTime?
+  bankVerifiedAt     DateTime?
+  /// NDPA: when this record must be reviewed/erased
+  retentionUntil     DateTime?
+  erasedAt           DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  branch         Branch?                 @relation(fields: [branchId], references: [id])
+  dsrs           DataSubjectRequest[]
+  sessions       CustomerSession[]
+  verifications  KycVerification[]
+  documents      KycDocument[]
+  screenings     ScreeningResult[]
+  fraudSignals   FraudSignal[]
+  devices        DeviceFingerprint[]
+  riskFlags      CustomerRiskFlag[]
+  bureauPulls    BureauPull[]
+  bureauReports  BureauReport[]
+  applications   LoanApplication[]
+  assessments    EligibilityAssessment[]
+  statements          BankStatementAnalysis[]
+  loans               Loan[]
+  linkedAccounts      LinkedAccount[]
+  mandates            Mandate[]
+  collectionCases     CollectionCase[]
+  behaviourSnapshots  BehaviourSnapshot[]
+
+  @@index([branchId])
+  @@index([lastName, firstName])
+  @@index([emailHash])
+  @@index([ninHash])
+  @@index([accountNumberHash])
+}
+
+/// Reusable consent record (bureau pulls, GSI/autodebit, data processing, LLM processing…).
+model Consent {
+  id           String        @id @default(cuid())
+  subjectType  String        @default("CUSTOMER")
+  subjectId    String
+  purpose      String
+  lawfulBasis  String        @default("CONSENT")
+  status       ConsentStatus @default(GRANTED)
+  textVersion  String
+  channel      String        @default("WEB")
+  ip           String?
+  userAgent    String?       @db.Text
+  grantedAt    DateTime      @default(now())
+  revokedAt    DateTime?
+  expiresAt    DateTime?
+  evidenceHash String?
+  recordedById String?
+  metadata     Json?
+
+  @@index([subjectType, subjectId, purpose])
+  @@index([status, expiresAt])
+}
+
+model DataSubjectRequest {
+  id          String    @id @default(cuid())
+  customerId  String
+  type        DsrType
+  status      DsrStatus @default(OPEN)
+  details     String?   @db.Text
+  /// NDPA: respond within 30 days
+  dueAt       DateTime
+  handledById String?
+  createdAt   DateTime  @default(now())
+  closedAt    DateTime?
+
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@index([status, dueAt])
+}
+
+/**
+ * ───────────── infrastructure ─────────────
+ */
+
+model IdempotencyKey {
+  id             String   @id
+  scope          String
+  requestHash    String
+  responseStatus Int?
+  responseBody   Json?
+  createdAt      DateTime @default(now())
+  expiresAt      DateTime
+
+  @@index([expiresAt])
+}
+
+/**
+ * ───────────── demo analytics (replaced by real aggregates in later prompts) ─────────────
+ */
+
+model PortfolioSnapshot {
+  id              String   @id @default(cuid())
+  date            DateTime @db.Date
+  disbursedKobo   BigInt
+  collectedKobo   BigInt
+  outstandingKobo BigInt
+  dueKobo         BigInt
+  par1Bps         Int
+  par30Bps        Int
+  par90Bps        Int
+  activeBorrowers Int
+  applications    Int
+  approvedCount   Int
+
+  @@unique([date])
+}
+
+model DemoDataset {
+  key  String @id
+  json Json
+}
+
+/**
+ * ═══════════════════ PROMPT 2: customer portal, KYC, screening, fraud ═══════════════════
+ */
+
+model CustomerSession {
+  id           String    @id @default(cuid())
+  customerId   String
+  tokenHash    String    @unique
+  ip           String?
+  userAgent    String?   @db.Text
+  deviceHash   String?
+  createdAt    DateTime  @default(now())
+  lastActiveAt DateTime  @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  customer     Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId])
+}
+
+/// One-time codes (phone login/registration, email verification, e-signature). Only an HMAC of the code is stored.
+model OtpChallenge {
+  id              String    @id @default(cuid())
+  purpose         String
+  customerId      String?
+  destinationHash String
+  codeHash        String
+  attempts        Int       @default(0)
+  resendCount     Int       @default(0)
+  ip              String?
+  expiresAt       DateTime
+  consumedAt      DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([destinationHash, createdAt])
+  @@index([customerId, purpose])
+}
+
+/// Result of a KYC check. Raw biometric images are NOT stored; only the outcome, reference, confidence and timestamp.
+model KycVerification {
+  id              String    @id @default(cuid())
+  customerId      String
+  type            String
+  provider        String
+  status          String
+  referenceId     String?
+  matchConfidence Int?
+  livenessPassed  Boolean?
+  summary         String
+  /// non-PII details (e.g. which fields matched)
+  details         Json?
+  createdAt       DateTime  @default(now())
+  completedAt     DateTime?
+  customer        Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, referenceId])
+  @@index([customerId, type])
+}
+
+model KycDocument {
+  id            String    @id @default(cuid())
+  customerId    String
+  applicationId String?
+  kind          String
+  fileName      String
+  mimeType      String
+  sizeBytes     Int
+  sha256        String
+  storageKey    String
+  /// per-file data key, wrapped (encrypted) with FieldCipher
+  keyEnc        String    @db.Text
+  scanStatus    String    @default("PENDING")
+  scanEngine    String?
+  reviewStatus  String    @default("PENDING")
+  reviewNote    String?
+  reviewedById  String?
+  reviewedAt    DateTime?
+  uploadedAt    DateTime  @default(now())
+  deletedAt     DateTime?
+  customer      Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId, kind])
+  @@index([applicationId])
+}
+
+model ScreeningResult {
+  id         String   @id @default(cuid())
+  customerId String
+  type       String
+  provider   String
+  status     String
+  matchCount Int      @default(0)
+  reference  String?
+  details    Json?
+  createdAt  DateTime @default(now())
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId, type])
+}
+
+model FraudSignal {
+  id                String    @id @default(cuid())
+  customerId        String
+  applicationId     String?
+  type              String
+  severity          String
+  detail            String
+  relatedCustomerId String?
+  createdAt         DateTime  @default(now())
+  resolvedAt        DateTime?
+  resolvedById      String?
+  resolutionNote    String?
+  customer          Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId, resolvedAt])
+  @@index([type, severity])
+}
+
+model DeviceFingerprint {
+  id          String   @id @default(cuid())
+  customerId  String
+  fingerprint String
+  ip          String?
+  userAgent   String?  @db.Text
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, fingerprint])
+  @@index([fingerprint])
+}
+
+/// Risk flags other modules consume (collections prioritisation in prompt 4).
+model CustomerRiskFlag {
+  id         String    @id @default(cuid())
+  customerId String
+  type       String
+  source     String
+  severity   String
+  detail     String
+  active     Boolean   @default(true)
+  createdAt  DateTime  @default(now())
+  clearedAt  DateTime?
+  customer   Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId, active])
+  @@index([source, createdAt])
+}
+
+/**
+ * ═══════════════════ PROMPT 2: credit bureau ═══════════════════
+ */
+
+model BureauPull {
+  id            String   @id @default(cuid())
+  customerId    String
+  applicationId String?
+  reportId      String?
+  bureau        String
+  reason        String
+  status        String
+  costKobo      BigInt   @default(0)
+  durationMs    Int?
+  requestedById String?
+  consentId     String?
+  attempts      Int      @default(1)
+  error         String?  @db.Text
+  createdAt     DateTime @default(now())
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId, createdAt])
+  @@index([createdAt])
+  @@index([bureau, status])
+}
+
+model BureauReport {
+  id                         String   @id @default(cuid())
+  customerId                 String
+  pullReason                 String
+  pulledAt                   DateTime @default(now())
+  expiresAt                  DateTime
+  bureausQueried             Json
+  bureausFailed              Json
+  bestScore                  Int?
+  lowestScore                Int?
+  averageScore               Int?
+  scoreBand                  String?
+  worstDpdEver               Int      @default(0)
+  activeFacilityCount        Int      @default(0)
+  totalOutstandingKobo       BigInt   @default(0)
+  totalMonthlyObligationKobo BigInt   @default(0)
+  enquiries30d               Int      @default(0)
+  enquiries90d               Int      @default(0)
+  enquiries180d              Int      @default(0)
+  defaultCount               Int      @default(0)
+  writeOffCount              Int      @default(0)
+  hasWriteOff24m             Boolean  @default(false)
+  lastWriteOffMonthsAgo      Int?
+  hasDpd90In12m              Boolean  @default(false)
+  elsewhereDefault           Boolean  @default(false)
+  fraudFlag                  Boolean  @default(false)
+  legalActionCount           Int      @default(0)
+  soldToCollectionsCount     Int      @default(0)
+  guarantorExposureKobo      BigInt   @default(0)
+  thinFile                   Boolean  @default(false)
+  customer                   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  scores     BureauScore[]
+  facilities BureauFacility[]
+  enquiries  BureauEnquiry[]
+  flags      BureauFlag[]
+
+  @@index([customerId, pulledAt])
+}
+
+model BureauScore {
+  id       String       @id @default(cuid())
+  reportId String
+  bureau   String
+  score    Int?
+  band     String?
+  minScore Int
+  maxScore Int
+  report   BureauReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([reportId])
+}
+
+model BureauFacility {
+  id                 String                @id @default(cuid())
+  reportId           String
+  sources            Json
+  lender             String
+  productType        String
+  amountGrantedKobo  BigInt
+  outstandingKobo    BigInt
+  status             String
+  tenorMonths        Int?
+  monthlyPaymentKobo BigInt                @default(0)
+  openedAt           DateTime              @db.Date
+  closedAt           DateTime?             @db.Date
+  lastPaymentAt      DateTime?             @db.Date
+  worstDpd           Int                   @default(0)
+  isActive           Boolean               @default(true)
+  legalAction        Boolean               @default(false)
+  soldToCollections  Boolean               @default(false)
+  isGuarantor        Boolean               @default(false)
+  conflict           Boolean               @default(false)
+  dedupeKey          String
+  report             BureauReport          @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  months             BureauFacilityMonth[]
+
+  @@index([reportId])
+}
+
+model BureauFacilityMonth {
+  id         String         @id @default(cuid())
+  facilityId String
+  month      String         @db.Char(7)
+  dpd        Int
+  facility   BureauFacility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  @@index([facilityId])
+}
+
+model BureauEnquiry {
+  id       String       @id @default(cuid())
+  reportId String
+  lender   String
+  date     DateTime     @db.Date
+  purpose  String
+  sources  Json
+  report   BureauReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([reportId])
+}
+
+model BureauFlag {
+  id       String       @id @default(cuid())
+  reportId String
+  type     String
+  source   String
+  detail   String
+  date     DateTime     @db.Date
+  report   BureauReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([reportId])
+}
+
+/// Data furnishing: our repayment performance reported to a bureau.
+model BureauSubmission {
+  id            String   @id @default(cuid())
+  bureau        String
+  period        String   @db.Char(7)
+  fileName      String
+  format        String
+  recordCount   Int
+  acceptedCount Int      @default(0)
+  rejectedCount Int      @default(0)
+  status        String
+  errors        Json?
+  submittedAt   DateTime @default(now())
+
+  @@index([bureau, period])
+}
+
+/**
+ * ═══════════════════ PROMPT 2: applications, eligibility, scorecards ═══════════════════
+ */
+
+model Scorecard {
+  id          String    @id @default(cuid())
+  key         String
+  version     Int
+  name        String
+  status      String    @default("DRAFT")
+  definition  Json
+  notes       String?   @db.Text
+  createdById String?
+  createdAt   DateTime  @default(now())
+  activatedAt DateTime?
+  retiredAt   DateTime?
+
+  @@unique([key, version])
+  @@index([key, status])
+}
+
+model LoanApplication {
+  id                  String    @id @default(cuid())
+  reference           String    @unique
+  customerId          String
+  productId           String
+  branchId            String?
+  channel             String    @default("PORTAL")
+  requestedAmountKobo BigInt
+  tenorMonths         Int
+  purpose             String?
+  status              String    @default("DRAFT")
+  statusReason        String?
+  /// pricing snapshot at submission (rate, method, fees, penalty)
+  pricing             Json
+  kycTierAtSubmission Int?
+  assignedToId        String?
+  createdById         String?
+  submittedAt         DateTime?
+  decidedAt           DateTime?
+  /// self-reported monthly income at time of application (kobo)
+  selfReportedIncomeKobo       BigInt?
+  /// self-reported total outstanding loan balance at time of application (kobo)
+  selfReportedOutstandingKobo  BigInt?
+  /// collateral: description of stock/securities pledged (when product.allowCollateral)
+  collateralStockDesc          String?  @db.Text
+  /// collateral: description of property pledged (when product.allowCollateral)
+  collateralPropertyDesc       String?  @db.Text
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  customer    Customer                @relation(fields: [customerId], references: [id])
+  product     LoanProduct             @relation(fields: [productId], references: [id])
+  events      ApplicationEvent[]
+  assessments EligibilityAssessment[]
+  offers      LoanOffer[]
+  loan        Loan?
+  guarantors  Guarantor[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([branchId, status])
+}
+
+/// Guarantor linked to a loan application. PII is field-encrypted; phone has a blind index for deduplication checks.
+model Guarantor {
+  id            String   @id @default(cuid())
+  applicationId String
+  firstName     String
+  lastName      String
+  /// encrypted phone (AAD guarantor:<id>:phone)
+  phoneEnc      String   @db.Text
+  phoneHash     String
+  relationship  String
+  occupation    String?
+  /// encrypted yyyy-mm-dd
+  dobEnc        String?  @db.Text
+  /// encrypted BVN
+  bvnEnc        String?  @db.Text
+  /// encrypted JSON {line1, city, state, landmark}
+  addressEnc    String   @db.Text
+  idType        String?  // NIN | INTL_PASSPORT | DRIVERS_LICENSE | VOTERS_CARD
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  application LoanApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+  @@index([phoneHash])
+}
+
+model ApplicationEvent {
+  id            String          @id @default(cuid())
+  applicationId String
+  fromStatus    String?
+  toStatus      String
+  actorType     String
+  actorId       String?
+  actorName     String
+  reason        String?
+  createdAt     DateTime        @default(now())
+  application   LoanApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId, createdAt])
+}
+
+model EligibilityAssessment {
+  id                      String           @id @default(cuid())
+  customerId              String
+  applicationId           String?
+  productId               String
+  scorecardId             String
+  requestedAmountKobo     BigInt
+  tenorMonths             Int
+  outcome                 String
+  score                   Int
+  scoreBand               String
+  maxAmountKobo           BigInt
+  maxRepaymentKobo        BigInt
+  requestedRepaymentKobo  BigInt
+  dtiBps                  Int
+  recognisedIncomeKobo    BigInt
+  externalObligationsKobo BigInt
+  kycTier                 Int
+  kycCapKobo              BigInt
+  reasons                 Json
+  suggestions             Json
+  alternatives            Json
+  factors                 Json
+  firedRules              Json
+  /// the non-PII facts evaluated (audit / reproducibility)
+  facts                   Json
+  bureauReportId          String?
+  simulated               Boolean          @default(false)
+  createdById             String?
+  createdAt               DateTime         @default(now())
+  customer                Customer         @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  application             LoanApplication? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+
+  @@index([customerId, createdAt])
+  @@index([applicationId])
+}
+
+model BankStatementAnalysis {
+  id                   String   @id @default(cuid())
+  customerId           String
+  applicationId        String?
+  source               String
+  documentId           String?
+  periodMonths         Int
+  avgMonthlyInflowKobo BigInt
+  inflowStability      Int
+  avgBalanceKobo       BigInt
+  gamblingFlag         Boolean  @default(false)
+  overdraftFlag        Boolean  @default(false)
+  salaryDetected       Boolean  @default(false)
+  salaryDay            Int?
+  monthly              Json
+  createdAt            DateTime @default(now())
+  customer             Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId, createdAt])
+}
+
+/**
+ * ═══════════════════ PROMPT 3: offers, loans, ledger, disbursement, autodebit/GSI ═══════════════════
+ */
+
+enum OfferStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  WITHDRAWN
+}
+
+/// Offer letter generated after approval. One ACCEPTED offer per application; prior offers (counter-offers) are WITHDRAWN.
+model LoanOffer {
+  id                        String      @id @default(cuid())
+  applicationId             String
+  offerNumber               String      @unique
+  isCounterOffer            Boolean     @default(false)
+  principalKobo             BigInt
+  tenorMonths               Int
+  monthlyRateBps            Int
+  interestMethod            String
+  totalInterestKobo         BigInt
+  totalFeesKobo             BigInt
+  totalPenaltyProjectedKobo BigInt      @default(0)
+  totalCostOfCreditKobo     BigInt
+  totalRepayableKobo        BigInt
+  gsiBps                    Int         @default(0)
+  scheduleJson              Json
+  autodebitConsentRequired  Boolean     @default(true)
+  gsiConsentRequired        Boolean     @default(true)
+  coolingOffHours           Int         @default(48)
+  status                    OfferStatus @default(DRAFT)
+  pdfStorageKey             String?
+  sentAt                    DateTime?
+  expiresAt                 DateTime?
+  acceptedAt                DateTime?
+  declinedAt                DateTime?
+  declineReason             String?
+  createdById               String?
+  createdAt                 DateTime    @default(now())
+
+  application LoanApplication  @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  acceptance  OfferAcceptance?
+
+  @@index([applicationId, status])
+}
+
+/// E-signature + OTP evidence of offer acceptance, plus FCCPC cooling-off tracking.
+model OfferAcceptance {
+  id                     String   @id @default(cuid())
+  offerId                String   @unique
+  otpChallengeId         String?
+  eSignatureName         String
+  eSignatureHash         String
+  acceptedTermsVersion   String
+  ip                     String?
+  userAgent              String?  @db.Text
+  coolingOffEndsAt       DateTime
+  coolingOffWaived       Boolean  @default(false)
+  coolingOffWaivedReason String?
+  createdAt              DateTime @default(now())
+
+  offer LoanOffer @relation(fields: [offerId], references: [id], onDelete: Cascade)
+}
+
+enum LoanStatus {
+  DISBURSED
+  ACTIVE
+  Unpaid
+  RESTRUCTURED
+  CLOSED
+  WRITTEN_OFF
+}
+
+/// Booked loan, created on disbursement from an accepted offer. Source of truth for `LOAN_PORTFOLIO_PORT`.
+model Loan {
+  id                       String     @id @default(cuid())
+  applicationId            String     @unique
+  offerId                  String?
+  customerId               String
+  productId                String
+  branchId                 String?
+  reference                String     @unique
+  principalKobo            BigInt
+  disbursedAmountKobo      BigInt
+  tenorMonths              Int
+  monthlyRateBps           Int
+  interestMethod           String
+  totalCostOfCreditKobo    BigInt
+  status                   LoanStatus @default(DISBURSED)
+  disbursedAt              DateTime
+  maturityDate             DateTime
+  outstandingPrincipalKobo BigInt     @default(0)
+  dpd                      Int        @default(0)
+  ifrsStage                Int        @default(1)
+  restructureCount         Int        @default(0)
+  closedAt                 DateTime?
+  writtenOffAt             DateTime?
+  writtenOffAmountKobo     BigInt?
+  primaryLinkedAccountId   String?
+  createdAt                DateTime   @default(now())
+  updatedAt                DateTime   @updatedAt
+
+  customer         Customer              @relation(fields: [customerId], references: [id])
+  product          LoanProduct           @relation(fields: [productId], references: [id])
+  application      LoanApplication       @relation(fields: [applicationId], references: [id])
+  installments     LoanInstallment[]
+  repayments       Repayment[]
+  restructures     LoanRestructure[]
+  debitAttempts    DebitAttempt[]
+  disbursement     DisbursementRequest?
+  mandates         Mandate[]
+  stagingSnapshots LoanStagingSnapshot[]
+  collectionCases  CollectionCase[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([branchId, status])
+  @@index([dpd])
+}
+
+enum InstallmentStatus {
+  PENDING
+  PARTIAL
+  PAID
+  OVERDUE
+}
+
+model LoanInstallment {
+  id                 String            @id @default(cuid())
+  loanId             String
+  seq                Int
+  dueDate            DateTime          @db.Date
+  principalKobo      BigInt
+  interestKobo       BigInt
+  feeKobo            BigInt            @default(0)
+  totalKobo          BigInt
+  paidKobo           BigInt            @default(0)
+  penaltyAccruedKobo BigInt            @default(0)
+  status             InstallmentStatus @default(PENDING)
+  paidAt             DateTime?
+  loan               Loan              @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  @@unique([loanId, seq])
+  @@index([loanId, status])
+  @@index([dueDate, status])
+}
+
+model LoanRestructure {
+  id                String   @id @default(cuid())
+  loanId            String
+  approvalRequestId String?
+  reason            String
+  oldSchedule       Json
+  newSchedule       Json
+  newTenorMonths    Int
+  newMonthlyRateBps Int
+  requestedById     String?
+  appliedAt         DateTime @default(now())
+  loan              Loan     @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  @@index([loanId])
+}
+
+/**
+ * ── linked accounts & autodebit mandates ──
+ */
+
+enum LinkedAccountStatus {
+  PENDING
+  VERIFIED
+  FAILED
+  REMOVED
+}
+
+/// Additional BVN-matched accounts a borrower links for GSI/autodebit priority order, plus the primary repayment account.
+model LinkedAccount {
+  id                 String                @id @default(cuid())
+  customerId         String
+  accountNumberEnc   String                @db.Text
+  accountNumberHash  String
+  bankCode           String
+  bankName           String
+  accountNameEnc     String                @db.Text
+  isPrimary          Boolean               @default(false)
+  priority           Int                   @default(1)
+  status             LinkedAccountStatus   @default(PENDING)
+  verificationMethod String?
+  verificationRef    String?
+  bvnNameMatchScore  Int?
+  failureReason      String?
+  verifiedAt         DateTime?
+  removedAt          DateTime?
+  createdAt          DateTime              @default(now())
+  customer           Customer              @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  mandates           Mandate[]
+  debitAttempts      DebitAttempt[]
+  disbursements      DisbursementRequest[]
+
+  @@unique([customerId, accountNumberHash, bankCode])
+  @@index([customerId, status])
+}
+
+enum MandateType {
+  NIBSS_EMANDATE
+  CARD_TOKEN
+  GSI
+}
+
+enum MandateStatus {
+  PENDING
+  ACTIVE
+  FAILED
+  REVOKED
+  EXPIRED
+}
+
+/// Autodebit authority on a linked account: e-Mandate / card token (primary) or GSI (fallback, CBN-wide).
+model Mandate {
+  id              String         @id @default(cuid())
+  customerId      String
+  loanId          String?
+  linkedAccountId String?
+  type            MandateType
+  provider        String
+  status          MandateStatus  @default(PENDING)
+  consentId       String?
+  tokenRefEnc     String?        @db.Text
+  cardLast4       String?
+  cardBin         String?
+  providerRef     String?
+  priority        Int            @default(1)
+  activatedAt     DateTime?
+  revokedAt       DateTime?
+  expiresAt       DateTime?
+  failureReason   String?
+  createdAt       DateTime       @default(now())
+  customer        Customer       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  loan            Loan?          @relation(fields: [loanId], references: [id])
+  linkedAccount   LinkedAccount? @relation(fields: [linkedAccountId], references: [id])
+  debitAttempts   DebitAttempt[]
+
+  @@index([customerId, status])
+  @@index([loanId])
+}
+
+enum DebitAttemptStatus {
+  SCHEDULED
+  INITIATED
+  SUCCESS
+  PARTIAL
+  FAILED
+  CANCELLED
+}
+
+/// One attempt by the debit engine (BullMQ) to collect an instalment via a mandate/linked account.
+model DebitAttempt {
+  id              String             @id @default(cuid())
+  loanId          String
+  installmentId   String?
+  mandateId       String?
+  linkedAccountId String?
+  method          MandateType
+  retryStage      String
+  attemptNumber   Int                @default(1)
+  amountKobo      BigInt
+  collectedKobo   BigInt             @default(0)
+  status          DebitAttemptStatus @default(SCHEDULED)
+  providerRef     String?
+  failureReason   String?
+  idempotencyKey  String             @unique
+  scheduledFor    DateTime
+  executedAt      DateTime?
+  repaymentId     String?
+  createdAt       DateTime           @default(now())
+  loan            Loan               @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  mandate         Mandate?           @relation(fields: [mandateId], references: [id])
+  linkedAccount   LinkedAccount?     @relation(fields: [linkedAccountId], references: [id])
+
+  @@index([loanId, status])
+  @@index([scheduledFor, status])
+  @@index([method, status])
+}
+
+/**
+ * ── repayments & ledger ──
+ */
+
+enum RepaymentMethod {
+  AUTODEBIT_MANDATE
+  AUTODEBIT_GSI
+  MANUAL
+  CASH
+  TRANSFER
+}
+
+enum RepaymentKind {
+  SCHEDULED
+  EARLY
+  PART
+  TOPUP_NET
+  RECOVERY
+}
+
+model Repayment {
+  id                     String          @id @default(cuid())
+  loanId                 String
+  receiptNumber          String          @unique
+  kind                   RepaymentKind   @default(SCHEDULED)
+  method                 RepaymentMethod
+  amountKobo             BigInt
+  allocatedPenaltyKobo   BigInt          @default(0)
+  allocatedFeeKobo       BigInt          @default(0)
+  allocatedInterestKobo  BigInt          @default(0)
+  allocatedPrincipalKobo BigInt          @default(0)
+  debitAttemptId         String?
+  journalEntryId         String?
+  createdById            String?
+  createdAt              DateTime        @default(now())
+  loan                   Loan            @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  @@index([loanId, createdAt])
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  EXPENSE
+}
+
+enum PostingSide {
+  DEBIT
+  CREDIT
+}
+
+/// Chart of accounts (control accounts; per-loan drill-down is via `Posting.loanId`, not a separate account per loan).
+model LedgerAccount {
+  id         String      @id @default(cuid())
+  code       String      @unique
+  name       String
+  type       AccountType
+  normalSide PostingSide
+  isSystem   Boolean     @default(true)
+  createdAt  DateTime    @default(now())
+
+  postings Posting[]
+}
+
+enum JournalSourceType {
+  DISBURSEMENT
+  ACCRUAL
+  REPAYMENT
+  FEE
+  PENALTY
+  WAIVER
+  WRITE_OFF
+  RECOVERY
+  RECONCILIATION_ADJUSTMENT
+  MANUAL
+}
+
+/// A balanced set of postings (sum of debits = sum of credits). Immutable; corrections post a reversing entry.
+model JournalEntry {
+  id           String            @id @default(cuid())
+  reference    String            @unique
+  date         DateTime          @db.Date
+  memo         String
+  sourceType   JournalSourceType
+  sourceId     String?
+  loanId       String?
+  reversalOfId String?           @unique
+  createdById  String?
+  createdAt    DateTime          @default(now())
+
+  postings   Posting[]
+  reversalOf JournalEntry? @relation("Reversal", fields: [reversalOfId], references: [id])
+  reversedBy JournalEntry? @relation("Reversal")
+
+  @@index([date])
+  @@index([sourceType, sourceId])
+  @@index([loanId])
+}
+
+model Posting {
+  id             String      @id @default(cuid())
+  journalEntryId String
+  accountId      String
+  loanId         String?
+  side           PostingSide
+  amountKobo     BigInt
+  createdAt      DateTime    @default(now())
+
+  journalEntry JournalEntry  @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+  account      LedgerAccount @relation(fields: [accountId], references: [id])
+
+  @@index([journalEntryId])
+  @@index([accountId, createdAt])
+  @@index([loanId])
+}
+
+/// Monthly (or on-demand) IFRS 9 staging + ECL snapshot per loan, feeding the provisioning report.
+model LoanStagingSnapshot {
+  id        String   @id @default(cuid())
+  loanId    String
+  asOfDate  DateTime @db.Date
+  stage     Int
+  dpd       Int
+  pdBps     Int
+  lgdBps    Int
+  eadKobo   BigInt
+  eclKobo   BigInt
+  createdAt DateTime @default(now())
+  loan      Loan     @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  @@unique([loanId, asOfDate])
+  @@index([asOfDate, stage])
+}
+
+/**
+ * ── disbursement & reconciliation ──
+ */
+
+enum DisbursementMethod {
+  AUTOMATED
+  MANUAL
+}
+
+enum DisbursementStatus {
+  PENDING
+  NAME_ENQUIRY_DONE
+  PROCESSING
+  SUCCESS
+  FAILED
+  REVERSED
+}
+
+model DisbursementRequest {
+  id                String             @id @default(cuid())
+  loanId            String             @unique
+  linkedAccountId   String?
+  amountKobo        BigInt
+  provider          String
+  method            DisbursementMethod @default(AUTOMATED)
+  status            DisbursementStatus @default(PENDING)
+  idempotencyKey    String             @unique
+  nameEnquiryResult Json?
+  providerRef       String?
+  failureReason     String?
+  retryCount        Int                @default(0)
+  approvalRequestId String?
+  initiatedById     String?
+  createdAt         DateTime           @default(now())
+  completedAt       DateTime?
+  loan              Loan               @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  linkedAccount     LinkedAccount?     @relation(fields: [linkedAccountId], references: [id])
+
+  @@index([status])
+  @@index([provider, providerRef])
+}
+
+model SettlementRecord {
+  id                    String   @id @default(cuid())
+  provider              String
+  externalRef           String
+  type                  String
+  amountKobo            BigInt
+  valueDate             DateTime @db.Date
+  rawPayload            Json
+  matchedDisbursementId String?
+  matchedRepaymentId    String?
+  status                String   @default("UNMATCHED")
+  createdAt             DateTime @default(now())
+
+  exceptions ReconciliationException[]
+
+  @@unique([provider, externalRef])
+  @@index([status, valueDate])
+}
+
+/// Underwriter notes / decisions / info-requests on an application (does not itself change status).
+model UnderwritingNote {
+  id            String   @id @default(cuid())
+  applicationId String
+  authorId      String?
+  authorName    String
+  kind          String   @default("NOTE")
+  body          String   @db.Text
+  createdAt     DateTime @default(now())
+
+  @@index([applicationId, createdAt])
+}
+
+model ReconciliationException {
+  id                 String           @id @default(cuid())
+  settlementRecordId String
+  reason             String
+  status             String           @default("OPEN")
+  resolvedById       String?
+  resolvedAt         DateTime?
+  note               String?          @db.Text
+  createdAt          DateTime         @default(now())
+  settlementRecord   SettlementRecord @relation(fields: [settlementRecordId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PROMPT 4: Collections, Behavioural Analytics, Customer 360, PII Vault
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A collections case is created for every loan that enters a Unpaid/overdue bucket.
+/// One loan → at most one active CollectionCase (unique on loanId where status != CLOSED).
+model CollectionCase {
+  id                 String             @id @default(cuid())
+  loanId             String
+  customerId         String
+  branchId           String?
+  assignedToId       String?            // StaffUser.id of the collections agent
+  assignedToName     String?
+  bucket             CollectionBucket   // DPD bucket at case creation; updated by delinquency cron
+  dpd                Int                @default(0)
+  status             CollectionStatus   @default(OPEN)
+  priority           Int                @default(50)        // 0-100; higher = more urgent
+  totalOutstandingKobo BigInt           @default(0)
+  closedAt           DateTime?
+  closedReason       String?
+  agencyId           String?            // ThirdPartyAgency.id if handed off
+  legalCaseRef       String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  loan               Loan               @relation(fields: [loanId], references: [id])
+  customer           Customer           @relation(fields: [customerId], references: [id])
+  activities         CollectionActivity[]
+  promisesToPay      PromiseToPay[]
+  agencyAssignments  AgencyAssignment[]
+
+  @@index([loanId])
+  @@index([customerId])
+  @@index([assignedToId, status])
+  @@index([status, bucket])
+  @@index([branchId, status])
+}
+
+enum CollectionBucket {
+  DPD_1_7
+  DPD_8_30
+  DPD_31_60
+  DPD_61_90
+  DPD_90_PLUS
+}
+
+enum CollectionStatus {
+  OPEN
+  IN_PROGRESS
+  PROMISE_TO_PAY
+  LEGAL
+  AGENCY
+  WRITTEN_OFF
+  SETTLED
+  CLOSED
+}
+
+/// Every contact attempt or field visit or legal note on a collection case.
+model CollectionActivity {
+  id              String               @id @default(cuid())
+  caseId          String
+  agentId         String?
+  agentName       String
+  channel         CollectionChannel
+  outcome         CollectionOutcome
+  notes           String?              @db.Text     // treated as PII, always redacted before LLM
+  contactedAt     DateTime             @default(now())
+  nextActionAt    DateTime?
+  nextActionNote  String?              @db.Text
+  durationSecs    Int?
+  isFieldVisit    Boolean              @default(false)
+  latitude        Float?
+  longitude       Float?
+  createdAt       DateTime             @default(now())
+
+  case            CollectionCase       @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId, contactedAt])
+  @@index([agentId, contactedAt])
+}
+
+enum CollectionChannel {
+  PHONE_CALL
+  SMS
+  EMAIL
+  WHATSAPP
+  FIELD_VISIT
+  PORTAL_MESSAGE
+  LEGAL_NOTICE
+}
+
+enum CollectionOutcome {
+  NO_ANSWER
+  WRONG_NUMBER
+  LEFT_VOICEMAIL
+  SPOKE_TO_BORROWER
+  SPOKE_TO_THIRD_PARTY   // only allowed third parties (employer HR, guarantor) — FCCPC rule
+  PROMISE_TO_PAY
+  REFUSED_TO_PAY
+  DISPUTE_RAISED
+  COMPLAINT_LODGED
+  VISITED_ADDRESS
+  PAYMENT_MADE
+  PARTIAL_PAYMENT
+}
+
+/// A commitment by the borrower to repay by a specific date.
+model PromiseToPay {
+  id              String           @id @default(cuid())
+  caseId          String
+  customerId      String
+  amountKobo      BigInt
+  promisedDate    DateTime         @db.Date
+  status          PtpStatus        @default(PENDING)
+  keepRate        Float?           // 0-1, computed after due date
+  brokenAt        DateTime?
+  keptAt          DateTime?
+  createdById     String?
+  createdAt       DateTime         @default(now())
+
+  case            CollectionCase   @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId])
+  @@index([customerId, promisedDate])
+  @@index([status, promisedDate])
+}
+
+enum PtpStatus {
+  PENDING
+  KEPT
+  BROKEN
+  PARTIAL
+  SUPERSEDED
+}
+
+/// A collections agency that can receive case assignments.
+model ThirdPartyAgency {
+  id              String              @id @default(cuid())
+  name            String
+  code            String              @unique
+  contactEmail    String?
+  contactPhone    String?
+  commissionBps   Int                 @default(1500) // 15% default
+  isActive        Boolean             @default(true)
+  createdAt       DateTime            @default(now())
+
+  assignments     AgencyAssignment[]
+}
+
+/// A collection case handed off to a third-party agency.
+model AgencyAssignment {
+  id              String           @id @default(cuid())
+  caseId          String
+  agencyId        String
+  assignedAt      DateTime         @default(now())
+  assignedById    String?
+  commissionBps   Int
+  status          String           @default("ACTIVE") // ACTIVE | RECALLED | SETTLED
+  settledAt       DateTime?
+  commissionPaidAt DateTime?
+  recoveredKobo   BigInt           @default(0)
+  createdAt       DateTime         @default(now())
+
+  case            CollectionCase   @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  agency          ThirdPartyAgency @relation(fields: [agencyId], references: [id])
+
+  @@index([caseId])
+  @@index([agencyId, status])
+}
+
+/// A settlement offer (waiver/discount/deferral) submitted as a maker-checker request (WAIVER type).
+/// The approval request carries the payload; this record is the result after execution.
+model SettlementOffer {
+  id              String    @id @default(cuid())
+  loanId          String
+  customerId      String
+  offerType       String    // WRITE_OFF_PARTIAL | INTEREST_WAIVER | PENALTY_WAIVER | DEFERRAL
+  originalAmountKobo BigInt
+  settledAmountKobo  BigInt
+  waivedKobo      BigInt
+  terms           Json      // free-form terms accepted
+  approvalRequestId String?
+  executedAt      DateTime  @default(now())
+  executedById    String?
+
+  @@index([loanId])
+  @@index([customerId])
+}
+
+/// Periodic behavioural feature snapshot for ML/collections prioritisation.
+/// One row per (customer, snapshotDate); latest row is the live profile.
+model BehaviourSnapshot {
+  id                    String   @id @default(cuid())
+  customerId            String
+  snapshotDate          DateTime @db.Date
+  onTimeRatio           Float    @default(0)   // 0–1
+  avgDaysLate           Float    @default(0)
+  paydaySensitivity     Float    @default(0)   // corr between salary day and repayment
+  channelResponsiveness Float    @default(0)   // 0–1
+  partialPaymentRatio   Float    @default(0)
+  avgBalanceAtDebitKobo BigInt   @default(0)
+  repeatBorrowVelocity  Float    @default(0)   // apps per 90 days
+  bureauDefaultCount    Int      @default(0)   // defaults at other lenders
+  pdScore               Float    @default(0.5) // 0–1, higher = riskier
+  segment               String   @default("UNKNOWN") // Reliable|SalaryCyclePayer|Reluctant|HighRisk|AtRiskOfChurn
+  summaryText           String   @db.Text      // template-generated, never contains raw PII
+  createdAt             DateTime @default(now())
+
+  customer              Customer @relation(fields: [customerId], references: [id])
+
+  @@unique([customerId, snapshotDate])
+  @@index([customerId, snapshotDate(sort: Desc)])
+  @@index([segment])
+}
+
+/// Early warning flags: borrowers predicted to miss next payment.
+model EarlyWarningFlag {
+  id            String    @id @default(cuid())
+  customerId    String
+  loanId        String
+  flagDate      DateTime  @db.Date
+  pdScore       Float
+  triggerReason String    // e.g. "DPD_TREND", "BUREAU_NEW_DEFAULT", "BALANCE_DROP"
+  status        String    @default("OPEN") // OPEN | ACTIONED | RESOLVED | DISMISSED
+  actionTakenAt DateTime?
+  actionNote    String?
+  createdAt     DateTime  @default(now())
+
+  @@index([customerId, flagDate])
+  @@index([status, flagDate])
+  @@index([loanId])
+}
+
+// ── PII Vault: token <-> real-value mapping ────────────────────────────────────
+// Stored in the same DB for simplicity; in production, isolate to a separate schema
+// with dedicated credentials and row-level encryption at the application layer.
+
+enum TokenType {
+  CUST      // customer identity (name/DOB)
+  BVN
+  NIN
+  PHONE
+  EMAIL
+  NUBAN     // bank account number
+  ADDR      // address
+  DEVICE
+  FREETEXT  // redacted free-text block
+}
+
+/// Maps an opaque token (e.g. BVN_X91PQ2) to an AES-GCM-encrypted real value.
+/// AAD: `pii_vault:<tokenType>:<tenantId>:<token>`.
+model PiiToken {
+  id          String    @id @default(cuid())
+  token       String    @unique  // e.g. "BVN_X91PQ2"
+  tokenType   TokenType
+  tenantId    String    @default("damez")
+  scope       String?   // optional: "session:<id>", "request:<id>" for ephemeral tokens
+  encValue    String    @db.Text // base64url AES-GCM(masterKey, AAD above)
+  createdAt   DateTime  @default(now())
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+
+  @@index([tokenType, tenantId])
+  @@index([scope])
+  @@index([expiresAt])
+}
+
+/// Audit log of detokenization (reveal) events — every time a raw value leaves the vault.
+model TokenRevealLog {
+  id          String   @id @default(cuid())
+  token       String
+  tokenType   TokenType
+  requesterId String?  // StaffUser.id
+  purpose     String
+  ip          String?
+  createdAt   DateTime @default(now())
+
+  @@index([token, createdAt])
+  @@index([requesterId, createdAt])
+}
+
+/// PII detector block log: every outbound LLM request blocked for raw PII.
+model LlmBlockLog {
+  id            String   @id @default(cuid())
+  feature       String   // which LLM feature triggered it
+  userId        String?
+  detectedTerms Json     // list of detected PII terms (type + hit, never the raw value)
+  requestHash   String   // SHA-256 of the sanitized payload for incident tracking
+  createdAt     DateTime @default(now())
+
+  @@index([feature, createdAt])
+  @@index([userId, createdAt])
+}
+
+/// LLM inference log: tokens-only record of every call that succeeded.
+model LlmInferenceLog {
+  id              String   @id @default(cuid())
+  feature         String
+  userId          String?
+  model           String
+  promptTokens    Int
+  completionTokens Int
+  latencyMs       Int
+  costMicroUsd    Int      @default(0)
+  createdAt       DateTime @default(now())
+
+  @@index([feature, createdAt])
+  @@index([userId, createdAt])
+}
+
+// ── Phase 5: Supervisory intelligence pre-aggregated snapshots ─────────────────
+
+enum BriefingStatus {
+  DRAFT
+  READY
+  FAILED
+}
+
+enum BriefingType {
+  DAILY_MORNING
+  WEEKLY_SUMMARY
+  MONTHLY_BOARD
+}
+
+enum AnomalySeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum AnomalyStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+model PortfolioDailyMetrics {
+  id                     String   @id @default(cuid())
+  snapshotDate           DateTime @db.Date
+  totalDisbursedKobo     BigInt   @default(0)
+  totalOutstandingKobo   BigInt   @default(0)
+  totalRepaidKobo        BigInt   @default(0)
+  par30Ratio             Float    @default(0)
+  par90Ratio             Float    @default(0)
+  nplRatio               Float    @default(0)
+  activeLoansCount       Int      @default(0)
+  disbursementsCount     Int      @default(0)
+  disbursementsKobo      BigInt   @default(0)
+  collectionEfficiency   Float    @default(0)
+  yieldBps               Int      @default(0)
+  costOfRiskBps          Int      @default(0)
+  eclTotalKobo           BigInt   @default(0)
+  avgLoanAmountKobo      BigInt   @default(0)
+  createdAt              DateTime @default(now())
+
+  @@unique([snapshotDate])
+  @@index([snapshotDate])
+}
+
+model BranchDailyMetrics {
+  id                   String   @id @default(cuid())
+  snapshotDate         DateTime @db.Date
+  branchId             String
+  branchName           String
+  activeLoansCount     Int      @default(0)
+  disbursementsKobo    BigInt   @default(0)
+  disbursementsCount   Int      @default(0)
+  outstandingKobo      BigInt   @default(0)
+  par30Ratio           Float    @default(0)
+  par90Ratio           Float    @default(0)
+  nplRatio             Float    @default(0)
+  collectionEfficiency Float    @default(0)
+  agentsCount          Int      @default(0)
+  createdAt            DateTime @default(now())
+
+  @@unique([snapshotDate, branchId])
+  @@index([snapshotDate])
+  @@index([branchId])
+}
+
+model AgentDailyMetrics {
+  id                  String   @id @default(cuid())
+  snapshotDate        DateTime @db.Date
+  agentId             String
+  agentName           String
+  branchId            String
+  casesHandled        Int      @default(0)
+  ptpCreated          Int      @default(0)
+  ptpKept             Int      @default(0)
+  amountRecoveredKobo BigInt   @default(0)
+  callsMade           Int      @default(0)
+  createdAt           DateTime @default(now())
+
+  @@unique([snapshotDate, agentId])
+  @@index([snapshotDate])
+  @@index([agentId])
+}
+
+model ProductDailyMetrics {
+  id                String   @id @default(cuid())
+  snapshotDate      DateTime @db.Date
+  productId         String
+  productName       String
+  activeLoansCount  Int      @default(0)
+  disbursedKobo     BigInt   @default(0)
+  outstandingKobo   BigInt   @default(0)
+  par30Ratio        Float    @default(0)
+  nplRatio          Float    @default(0)
+  avgTicketKobo     BigInt   @default(0)
+  yieldBps          Int      @default(0)
+  createdAt         DateTime @default(now())
+
+  @@unique([snapshotDate, productId])
+  @@index([snapshotDate])
+}
+
+model VintageCurve {
+  id               String   @id @default(cuid())
+  cohortMonth      DateTime @db.Date
+  monthOnBook      Int
+  disbursedKobo    BigInt
+  outstandingKobo  BigInt
+  par30Kobo        BigInt   @default(0)
+  par90Kobo        BigInt   @default(0)
+  lossKobo         BigInt   @default(0)
+  loanCount        Int
+  createdAt        DateTime @default(now())
+
+  @@unique([cohortMonth, monthOnBook])
+  @@index([cohortMonth])
+}
+
+model CollectionsDaily {
+  id                   String   @id @default(cuid())
+  snapshotDate         DateTime @db.Date
+  branchId             String?
+  openCasesCount       Int      @default(0)
+  resolvedCasesCount   Int      @default(0)
+  ptpKeptRate          Float    @default(0)
+  ptpBrokenRate        Float    @default(0)
+  cureRate30d          Float    @default(0)
+  amountRecoveredKobo  BigInt   @default(0)
+  agencyAssignedCount  Int      @default(0)
+  writeOffKobo         BigInt   @default(0)
+  createdAt            DateTime @default(now())
+
+  @@unique([snapshotDate, branchId])
+  @@index([snapshotDate])
+}
+
+model DebitDaily {
+  id                 String   @id @default(cuid())
+  snapshotDate       DateTime @db.Date
+  bankCode           String?
+  totalAttempts      Int      @default(0)
+  successCount       Int      @default(0)
+  failureCount       Int      @default(0)
+  successAmountKobo  BigInt   @default(0)
+  failureAmountKobo  BigInt   @default(0)
+  gsiTriggeredCount  Int      @default(0)
+  createdAt          DateTime @default(now())
+
+  @@unique([snapshotDate, bankCode])
+  @@index([snapshotDate])
+}
+
+model BureauDistributionDaily {
+  id             String   @id @default(cuid())
+  snapshotDate   DateTime @db.Date
+  scoreBucket    String   // e.g. "300-399", "400-499", etc.
+  customerCount  Int      @default(0)
+  avgScore       Float    @default(0)
+  par30Ratio     Float    @default(0)
+  createdAt      DateTime @default(now())
+
+  @@unique([snapshotDate, scoreBucket])
+  @@index([snapshotDate])
+}
+
+model ApprovalsQueueSnapshot {
+  id                String   @id @default(cuid())
+  snapshotDate      DateTime @db.Date
+  actionType        String
+  pendingCount      Int      @default(0)
+  escalatedCount    Int      @default(0)
+  avgAgeHours       Float    @default(0)
+  oldest            DateTime?
+  pendingAmountKobo BigInt   @default(0)
+  createdAt         DateTime @default(now())
+
+  @@unique([snapshotDate, actionType])
+  @@index([snapshotDate])
+}
+
+model AnomalyRecord {
+  id           String          @id @default(cuid())
+  detectedAt   DateTime        @default(now())
+  metric       String
+  dimension    String?         // e.g. branchId, bankCode, officerId
+  severity     AnomalySeverity
+  status       AnomalyStatus   @default(OPEN)
+  zScore       Float?
+  baseline     Float?
+  actual       Float?
+  description  String          @db.Text
+  llmExplanation String?       @db.Text
+  llmActions   Json?
+  acknowledgedById String?
+  acknowledgedAt   DateTime?
+  resolvedAt   DateTime?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@index([detectedAt, severity])
+  @@index([status, severity])
+  @@index([metric, dimension])
+}
+
+model ExecutiveBriefing {
+  id             String         @id @default(cuid())
+  briefingType   BriefingType
+  status         BriefingStatus @default(DRAFT)
+  periodStart    DateTime
+  periodEnd      DateTime
+  targetRoleKey  String?        // null = all exec roles; set to a specific role key to limit
+  targetBranchId String?        // null = portfolio-wide; set to scope to a branch
+  headline       String         @db.Text
+  bodyMd         String?        @db.MediumText
+  metricsSnapshot Json?
+  anomalyIds     Json?          // string[] of AnomalyRecord.id referenced in the brief
+  promptVersion  String         @default("v1")
+  modelUsed      String?
+  promptTokens   Int            @default(0)
+  completionTokens Int          @default(0)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  chatMessages   ExecChatMessage[]
+
+  @@index([briefingType, createdAt])
+  @@index([status, briefingType])
+  @@index([targetBranchId])
+}
+
+model ExecChatSession {
+  id         String   @id @default(cuid())
+  userId     String
+  title      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  messages ExecChatMessage[]
+
+  @@index([userId, createdAt])
+}
+
+model ExecChatMessage {
+  id         String    @id @default(cuid())
+  sessionId  String
+  briefingId String?
+  role       String    // "user" | "assistant"
+  content    String    @db.MediumText
+  toolCalls  Json?
+  toolResults Json?
+  pinned     Boolean   @default(false)
+  promptTokens Int     @default(0)
+  completionTokens Int @default(0)
+  createdAt  DateTime  @default(now())
+
+  session    ExecChatSession   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  briefing   ExecutiveBriefing? @relation(fields: [briefingId], references: [id])
+
+  @@index([sessionId, createdAt])
+  @@index([pinned])
+}
+
+model ExecPreference {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  briefingTime    String   @default("07:00")
+  channels        Json     @default("[]")
+  verbosity       String   @default("standard")
+  timezone        String   @default("Africa/Lagos")
+  updatedAt       DateTime @updatedAt
+}

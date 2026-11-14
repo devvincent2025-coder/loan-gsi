@@ -1,0 +1,7 @@
+# Build context is the repo root; keep the context small.
+# Suggested root-level .dockerignore entries: node_modules, .next, **/dist, .git, **/.env*
+node_modules
+.next
+playwright-report
+test-results
+.env*

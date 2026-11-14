@@ -1,0 +1,38 @@
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env: { MYSQL_ROOT_PASSWORD: root, MYSQL_DATABASE: damez, MYSQL_USER: damez, MYSQL_PASSWORD: damez }
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot" --health-interval=5s --health-timeout=5s --health-retries=30
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+    env:
+      DATABASE_URL: mysql://root:root@127.0.0.1:3306/damez
+      REDIS_URL: redis://127.0.0.1:6379
+      DEMO_MODE: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run build:shared
+      - run: npm run db:generate
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: Migrate and seed
+        run: |
+          mysql -h127.0.0.1 -uroot -proot -e "SET GLOBAL log_bin_trust_function_creators=1"
+          npm run db:deploy -w @damez/api && npm run db:seed
+      - run: npm test
+      - run: npm run test:e2e -w @damez/api
+      - run: npm run build -w @damez/web

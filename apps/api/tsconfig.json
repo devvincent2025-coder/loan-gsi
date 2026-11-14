@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": ".",
+    "baseUrl": ".",
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "incremental": true,
+    "removeComments": false,
+    "types": ["node", "jest"]
+  },
+  "include": ["src", "prisma", "scripts", "test"],
+  "exclude": ["node_modules", "dist"]
+}
